@@ -11,97 +11,122 @@ REDIS_URL = os.environ["REDIS_URL"]
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Подключение к Render Key Value
-db = redis.from_url(REDIS_URL, decode_responses=True)
+# Канал-медиатека
+CHANNEL_ID = -1003148826053
+
+db = redis.from_url(
+    REDIS_URL,
+    decode_responses=True
+)
 
 
 def tg(method, data=None):
-    """Запрос к Telegram Bot API."""
     try:
-        r = requests.post(
+        response = requests.post(
             f"{TELEGRAM_API}/{method}",
             json=data or {},
             timeout=20
         )
-        print(f"Telegram {method}: {r.status_code} {r.text[:500]}")
-        return r.json()
+
+        print(
+            f"Telegram {method}: "
+            f"{response.status_code} "
+            f"{response.text[:500]}",
+            flush=True
+        )
+
+        return response.json()
+
     except Exception as e:
-        print("Telegram error:", e)
+        print("Telegram error:", e, flush=True)
         return None
 
 
 def send_message(chat_id, text):
-    return tg("sendMessage", {
-        "chat_id": chat_id,
-        "text": text
-    })
+    return tg(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text
+        }
+    )
 
 
-def send_video(chat_id, file_id, caption=None):
-    data = {
-        "chat_id": chat_id,
-        "video": file_id
-    }
-
-    if caption:
-        data["caption"] = caption
-
-    return tg("sendVideo", data)
+def copy_channel_post(chat_id, message_id):
+    """
+    Показывает найденный пост пользователю,
+    не загружая видео повторно.
+    """
+    return tg(
+        "copyMessage",
+        {
+            "chat_id": chat_id,
+            "from_chat_id": CHANNEL_ID,
+            "message_id": message_id
+        }
+    )
 
 
 def normalize_tags(text):
-    """
-    Поддерживает:
-    коты, смешное, мемы
-    или
-    коты смешное мемы
-    """
     text = text.strip().lower()
 
     if "," in text:
-        tags = [x.strip() for x in text.split(",")]
+        tags = [
+            tag.strip().lstrip("#")
+            for tag in text.split(",")
+        ]
     else:
-        tags = [x.strip() for x in text.split()]
+        tags = [
+            tag.strip().lstrip("#")
+            for tag in text.split()
+        ]
 
-    # Убираем # и пустые значения
-    tags = [
-        tag.lstrip("#")
-        for tag in tags
-        if tag.strip()
-    ]
+    tags = [tag for tag in tags if tag]
 
-    # Убираем повторы
     return list(dict.fromkeys(tags))
 
 
-def save_video(chat_id, file_id, tags):
-    """
-    Сохраняем видео и создаём индекс по тегам.
-    """
+def get_owner():
+    owner = db.get("owner_chat_id")
 
-    video_id = db.incr("next_video_id")
+    if owner:
+        return int(owner)
 
-    video = {
-        "id": video_id,
+    return None
+
+
+def save_item(channel_message_id, file_id, media_type, tags):
+    item = {
+        "message_id": channel_message_id,
         "file_id": file_id,
+        "media_type": media_type,
         "tags": tags
     }
 
     db.set(
-        f"video:{video_id}",
-        json.dumps(video, ensure_ascii=False)
+        f"item:{channel_message_id}",
+        json.dumps(
+            item,
+            ensure_ascii=False
+        )
     )
 
-    db.sadd("videos", video_id)
+    db.sadd(
+        "library_items",
+        channel_message_id
+    )
 
     for tag in tags:
-        db.sadd(f"tag:{tag}", video_id)
+        db.sadd(
+            f"tag:{tag}",
+            channel_message_id
+        )
 
-    return video_id
 
-
-def get_video(video_id):
-    raw = db.get(f"video:{video_id}")
+def get_item(message_id):
+    raw = db.get(
+        f"item:{message_id}"
+    )
 
     if not raw:
         return None
@@ -109,25 +134,92 @@ def get_video(video_id):
     return json.loads(raw)
 
 
-def search_videos(tags):
+def get_queue():
+    return db.lrange(
+        "tag_queue",
+        0,
+        -1
+    )
+
+
+def current_pending():
+    raw = db.lindex(
+        "tag_queue",
+        0
+    )
+
+    if not raw:
+        return None
+
+    return json.loads(raw)
+
+
+def ask_for_next_tags():
+    owner = get_owner()
+
+    if not owner:
+        return
+
+    pending = current_pending()
+
+    if not pending:
+        send_message(
+            owner,
+            "✅ Очередь разобрана. "
+            "Новых видео без тегов нет."
+        )
+        return
+
+    queue_size = db.llen("tag_queue")
+
+    message_id = pending["message_id"]
+
+    send_message(
+        owner,
+        "🎬 Новое видео из канала.\n\n"
+        f"В очереди: {queue_size}\n"
+        f"Message ID: {message_id}\n\n"
+        "Напиши теги через запятую.\n\n"
+        "Например:\n"
+        "блондинка, соло, избранное\n\n"
+        "Команды:\n"
+        "/skip — пропустить пока\n"
+        "/delete — убрать из каталога"
+    )
+
+    # Показываем копию видео,
+    # чтобы было понятно, что именно размечаем.
+    copy_channel_post(
+        owner,
+        message_id
+    )
+
+
+def search_items(tags):
     if not tags:
         return []
 
-    sets = [f"tag:{tag}" for tag in tags]
+    keys = [
+        f"tag:{tag}"
+        for tag in tags
+    ]
 
-    # Если введено несколько тегов,
-    # ищем видео, где присутствуют ВСЕ эти теги.
-    ids = db.sinter(*sets)
+    ids = db.sinter(*keys)
 
-    videos = []
+    items = []
 
-    for video_id in ids:
-        video = get_video(video_id)
+    for message_id in ids:
+        item = get_item(message_id)
 
-        if video:
-            videos.append(video)
+        if item:
+            items.append(item)
 
-    return videos
+    items.sort(
+        key=lambda x: x["message_id"],
+        reverse=True
+    )
+
+    return items
 
 
 @app.route("/", methods=["GET"])
@@ -135,26 +227,14 @@ def home():
     try:
         db.ping()
         database = "connected"
+
     except Exception as e:
         database = f"error: {e}"
 
-    return f"Vlad Media Library Bot is running. Database: {database}"
-
-
-@app.route("/setup", methods=["GET"])
-def setup():
-    webhook_url = request.url_root.rstrip("/") + "/webhook"
-
-    response = requests.get(
-        f"{TELEGRAM_API}/setWebhook",
-        params={
-            "url": webhook_url,
-            "drop_pending_updates": True
-        },
-        timeout=20
+    return (
+        "Vlad Media Library Bot is running. "
+        f"Database: {database}"
     )
-
-    return jsonify(response.json())
 
 
 @app.route("/checkbot", methods=["GET"])
@@ -164,129 +244,437 @@ def checkbot():
         timeout=20
     )
 
-    return jsonify(response.json())
+    return jsonify(
+        response.json()
+    )
+
+
+@app.route("/setup", methods=["GET"])
+def setup():
+    webhook_url = (
+        request.url_root.rstrip("/")
+        + "/webhook"
+    )
+
+    response = requests.get(
+        f"{TELEGRAM_API}/setWebhook",
+        params={
+            "url": webhook_url
+        },
+        timeout=20
+    )
+
+    return jsonify(
+        response.json()
+    )
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    update = request.get_json(silent=True) or {}
+    update = (
+        request.get_json(
+            silent=True
+        )
+        or {}
+    )
 
-    print("UPDATE:", json.dumps(update, ensure_ascii=False)[:3000])
+    print(
+        "UPDATE:",
+        json.dumps(
+            update,
+            ensure_ascii=False
+        )[:3000],
+        flush=True
+    )
 
-    message = update.get("message")
+    # =====================================
+    # НОВЫЙ ПОСТ В КАНАЛЕ
+    # =====================================
+
+    post = update.get(
+        "channel_post"
+    )
+
+    if post:
+        chat_id = post["chat"]["id"]
+
+        # Игнорируем другие каналы
+        if chat_id != CHANNEL_ID:
+            return "OK", 200
+
+        message_id = post["message_id"]
+
+        media_type = None
+        file_id = None
+
+        if post.get("video"):
+            media_type = "video"
+            file_id = (
+                post["video"]
+                .get("file_id")
+            )
+
+        elif post.get("document"):
+            document = post["document"]
+
+            mime = document.get(
+                "mime_type",
+                ""
+            )
+
+            if mime.startswith(
+                "video/"
+            ):
+                media_type = (
+                    "video_document"
+                )
+
+                file_id = document.get(
+                    "file_id"
+                )
+
+        elif post.get("animation"):
+            media_type = "animation"
+
+            file_id = (
+                post["animation"]
+                .get("file_id")
+            )
+
+        # Нас интересуют только медиа
+        if media_type and file_id:
+
+            pending = {
+                "message_id": message_id,
+                "file_id": file_id,
+                "media_type": media_type
+            }
+
+            # Не добавляем один пост
+            # в очередь повторно
+            queue_ids = []
+
+            for raw in get_queue():
+                try:
+                    q = json.loads(raw)
+                    queue_ids.append(
+                        q["message_id"]
+                    )
+                except Exception:
+                    pass
+
+            if (
+                message_id
+                not in queue_ids
+                and not db.exists(
+                    f"item:{message_id}"
+                )
+            ):
+                was_empty = (
+                    db.llen(
+                        "tag_queue"
+                    )
+                    == 0
+                )
+
+                db.rpush(
+                    "tag_queue",
+                    json.dumps(
+                        pending,
+                        ensure_ascii=False
+                    )
+                )
+
+                # Если очередь до этого была пустой,
+                # сразу спрашиваем теги.
+                if was_empty:
+                    ask_for_next_tags()
+
+        return "OK", 200
+
+    # =====================================
+    # ЛИЧНЫЕ СООБЩЕНИЯ БОТУ
+    # =====================================
+
+    message = update.get(
+        "message"
+    )
 
     if not message:
         return "OK", 200
 
-    chat_id = message["chat"]["id"]
-    text = (message.get("text") or "").strip()
+    chat = message.get(
+        "chat",
+        {}
+    )
 
-    # ------------------------
+    # Работаем только в личке
+    if chat.get("type") != "private":
+        return "OK", 200
+
+    chat_id = chat["id"]
+
+    text = (
+        message.get("text")
+        or ""
+    ).strip()
+
+    # =====================================
     # /start
-    # ------------------------
+    # =====================================
 
     if text == "/start":
+
+        # Первый пользователь,
+        # запустивший бота, становится владельцем.
+        owner = get_owner()
+
+        if owner is None:
+            db.set(
+                "owner_chat_id",
+                chat_id
+            )
+
+        elif owner != chat_id:
+            send_message(
+                chat_id,
+                "⛔ Этот бот является "
+                "личной медиатекой."
+            )
+
+            return "OK", 200
+
         send_message(
             chat_id,
             "🎬 Vlad Media Library\n\n"
-            "Перешли мне видео — я предложу добавить к нему теги.\n\n"
-            "После этого видео можно будет найти командой:\n"
-            "/search коты\n\n"
-            "Несколько тегов:\n"
-            "/search коты смешное\n\n"
-            "Другие команды:\n"
-            "/count — количество видео\n"
-            "/tags — список тегов\n"
-            "/cancel — отменить добавление"
+            "Теперь просто пересылай видео "
+            "в свой канал.\n\n"
+            "Я увижу новый пост и попрошу "
+            "тебя указать теги.\n\n"
+            "Команды:\n"
+            "/search тег — поиск\n"
+            "/tags — все теги\n"
+            "/count — размер каталога\n"
+            "/queue — очередь без тегов\n"
+            "/next — показать текущее видео"
         )
+
+        # Если видео уже накопились
+        if db.llen("tag_queue") > 0:
+            ask_for_next_tags()
 
         return "OK", 200
 
-    # ------------------------
-    # /cancel
-    # ------------------------
+    # Запрещаем управление посторонним
+    owner = get_owner()
 
-    if text == "/cancel":
-        db.delete(f"pending:{chat_id}")
-
+    if owner != chat_id:
         send_message(
             chat_id,
-            "❌ Добавление отменено."
+            "⛔ Нет доступа."
         )
 
         return "OK", 200
 
-    # ------------------------
+    # =====================================
     # /count
-    # ------------------------
+    # =====================================
 
     if text == "/count":
-        count = db.scard("videos")
+        count = db.scard(
+            "library_items"
+        )
+
+        queue = db.llen(
+            "tag_queue"
+        )
 
         send_message(
             chat_id,
-            f"🎬 В библиотеке видео: {count}"
+            f"🎬 В каталоге: {count}\n"
+            f"⏳ Без тегов: {queue}"
         )
 
         return "OK", 200
 
-    # ------------------------
+    # =====================================
+    # /queue
+    # =====================================
+
+    if text == "/queue":
+        queue = db.llen(
+            "tag_queue"
+        )
+
+        send_message(
+            chat_id,
+            f"⏳ Видео без тегов: {queue}"
+        )
+
+        return "OK", 200
+
+    # =====================================
+    # /next
+    # =====================================
+
+    if text == "/next":
+        if db.llen(
+            "tag_queue"
+        ) == 0:
+
+            send_message(
+                chat_id,
+                "✅ Очередь пустая."
+            )
+
+        else:
+            ask_for_next_tags()
+
+        return "OK", 200
+
+    # =====================================
+    # /skip
+    # =====================================
+
+    if text == "/skip":
+        raw = db.lpop(
+            "tag_queue"
+        )
+
+        if raw:
+            # Переносим текущее видео
+            # в конец очереди
+            db.rpush(
+                "tag_queue",
+                raw
+            )
+
+            send_message(
+                chat_id,
+                "⏭ Перенёс видео "
+                "в конец очереди."
+            )
+
+            ask_for_next_tags()
+
+        else:
+            send_message(
+                chat_id,
+                "Очередь пустая."
+            )
+
+        return "OK", 200
+
+    # =====================================
+    # /delete
+    # =====================================
+
+    if text == "/delete":
+        raw = db.lpop(
+            "tag_queue"
+        )
+
+        if raw:
+            send_message(
+                chat_id,
+                "🗑 Убрал это видео "
+                "из очереди каталога.\n"
+                "Сам пост в канале "
+                "не удалён."
+            )
+
+            if db.llen(
+                "tag_queue"
+            ) > 0:
+                ask_for_next_tags()
+
+        else:
+            send_message(
+                chat_id,
+                "Очередь пустая."
+            )
+
+        return "OK", 200
+
+    # =====================================
     # /tags
-    # ------------------------
+    # =====================================
 
     if text == "/tags":
         tags = []
 
-        for key in db.scan_iter("tag:*"):
+        for key in db.scan_iter(
+            "tag:*"
+        ):
             tag = key[4:]
-            count = db.scard(key)
 
-            tags.append((tag, count))
+            count = db.scard(
+                key
+            )
 
-        tags.sort(key=lambda x: (-x[1], x[0]))
+            tags.append(
+                (tag, count)
+            )
+
+        tags.sort(
+            key=lambda x: (
+                -x[1],
+                x[0]
+            )
+        )
 
         if not tags:
             send_message(
                 chat_id,
                 "Пока тегов нет."
             )
+
         else:
             lines = [
                 f"#{tag} — {count}"
-                for tag, count in tags[:100]
+                for tag, count
+                in tags[:100]
             ]
 
             send_message(
                 chat_id,
-                "🏷 Теги:\n\n" + "\n".join(lines)
+                "🏷 Теги:\n\n"
+                + "\n".join(lines)
             )
 
         return "OK", 200
 
-    # ------------------------
+    # =====================================
     # /search
-    # ------------------------
+    # =====================================
 
-    if text.startswith("/search"):
-        query = text[len("/search"):].strip()
+    if text.startswith(
+        "/search"
+    ):
+        query = text[
+            len("/search"):
+        ].strip()
 
         if not query:
             send_message(
                 chat_id,
-                "Напиши теги после команды.\n\n"
                 "Например:\n"
-                "/search коты\n\n"
-                "или:\n"
-                "/search коты смешное"
+                "/search блондинка\n\n"
+                "Несколько тегов:\n"
+                "/search блондинка соло"
             )
 
             return "OK", 200
 
-        tags = normalize_tags(query)
+        tags = normalize_tags(
+            query
+        )
 
-        videos = search_videos(tags)
+        items = search_items(
+            tags
+        )
 
-        if not videos:
+        if not items:
             send_message(
                 chat_id,
                 "🔎 Ничего не найдено."
@@ -296,132 +684,104 @@ def webhook():
 
         send_message(
             chat_id,
-            f"🔎 Найдено видео: {len(videos)}"
+            f"🔎 Найдено: {len(items)}"
         )
 
-        # Чтобы случайно не отправить сотни видео
-        for video in videos[:20]:
+        # Показываем первые 20 результатов
+        for item in items[:20]:
 
-            caption = (
-                f"🎬 #{video['id']}\n"
-                f"🏷 " +
-                ", ".join(
-                    "#" + tag
-                    for tag in video["tags"]
-                )
-            )
-
-            send_video(
+            copy_channel_post(
                 chat_id,
-                video["file_id"],
-                caption
+                item["message_id"]
             )
 
-        if len(videos) > 20:
+            formatted = ", ".join(
+                "#" + tag
+                for tag
+                in item["tags"]
+            )
+
             send_message(
                 chat_id,
-                f"Показаны первые 20 из {len(videos)}."
+                f"🏷 {formatted}"
+            )
+
+        if len(items) > 20:
+            send_message(
+                chat_id,
+                "Показаны первые "
+                f"20 из {len(items)}."
             )
 
         return "OK", 200
 
-    # ------------------------
-    # Получили новое видео
-    # ------------------------
+    # =====================================
+    # ВВОД ТЕГОВ ДЛЯ ТЕКУЩЕГО ВИДЕО
+    # =====================================
 
-    video = message.get("video")
+    pending = current_pending()
 
-    # Иногда видео отправляют как документ
-    document = message.get("document")
-
-    file_id = None
-
-    if video:
-        file_id = video.get("file_id")
-
-    elif document:
-        mime = document.get("mime_type", "")
-
-        if mime.startswith("video/"):
-            file_id = document.get("file_id")
-
-    if file_id:
-
-        # Временно сохраняем file_id,
-        # пока пользователь вводит теги.
-        db.set(
-            f"pending:{chat_id}",
-            file_id,
-            ex=3600
+    if pending and text:
+        tags = normalize_tags(
+            text
         )
-
-        send_message(
-            chat_id,
-            "✅ Видео получил!\n\n"
-            "Теперь напиши теги для него через запятую.\n\n"
-            "Например:\n"
-            "коты, смешное, мемы\n\n"
-            "Или отправь /cancel для отмены."
-        )
-
-        return "OK", 200
-
-    # ------------------------
-    # Пользователь вводит теги
-    # ------------------------
-
-    pending_file_id = db.get(
-        f"pending:{chat_id}"
-    )
-
-    if pending_file_id and text:
-
-        tags = normalize_tags(text)
 
         if not tags:
             send_message(
                 chat_id,
-                "Не смог распознать теги. Попробуй ещё раз."
+                "Не смог распознать теги."
             )
 
             return "OK", 200
 
-        video_id = save_video(
-            chat_id,
-            pending_file_id,
+        save_item(
+            pending["message_id"],
+            pending["file_id"],
+            pending["media_type"],
             tags
         )
 
-        db.delete(
-            f"pending:{chat_id}"
+        # Убираем размеченный элемент
+        db.lpop(
+            "tag_queue"
         )
 
-        formatted_tags = ", ".join(
+        formatted = ", ".join(
             "#" + tag
             for tag in tags
         )
 
         send_message(
             chat_id,
-            f"✅ Видео сохранено!\n\n"
-            f"🎬 Номер: #{video_id}\n"
-            f"🏷 {formatted_tags}"
+            "✅ Добавлено в каталог!\n\n"
+            f"🏷 {formatted}"
         )
+
+        # Автоматически переходим
+        # к следующему видео
+        if db.llen(
+            "tag_queue"
+        ) > 0:
+
+            ask_for_next_tags()
+
+        else:
+            send_message(
+                chat_id,
+                "🎉 Очередь полностью разобрана."
+            )
 
         return "OK", 200
 
-    # ------------------------
-    # Обычный текст
-    # ------------------------
+    # =====================================
+    # ПРОЧИЙ ТЕКСТ
+    # =====================================
 
-    if text:
-        send_message(
-            chat_id,
-            "Я не понял команду.\n\n"
-            "Для поиска используй:\n"
-            "/search тег\n\n"
-            "Или просто перешли мне видео."
-        )
+    send_message(
+        chat_id,
+        "Перешли видео в канал "
+        "или используй /search."
+    )
 
     return "OK", 200
 
