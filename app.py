@@ -8,9 +8,19 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
+@app.route("/setup", methods=["GET"])
+def setup():
+    webhook_url = "https://vlad-media-library-bot.onrender.com/webhook"
+    response = requests.get(
+        f"{TELEGRAM_API}/setWebhook",
+        params={"url": webhook_url}
+    )
+    return jsonify(response.json())
+
+
 @app.route("/", methods=["GET"])
 def home():
-    return "Vlad Media Library Bot is running", 200
+    return "Vlad Media Library Bot is running"
 
 
 @app.route("/webhook", methods=["POST"])
@@ -34,8 +44,3 @@ def webhook():
         )
 
     return jsonify({"ok": True})
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
