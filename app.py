@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import requests
 import redis
 from flask import Flask, request, jsonify
@@ -13,6 +14,9 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Твой Telegram-канал
 CHANNEL_ID = -1003148826053
+
+# Сколько случайных результатов показывать за один поиск
+SEARCH_LIMIT = 50
 
 db = redis.from_url(
     REDIS_URL,
@@ -73,13 +77,13 @@ def copy_message(chat_id, from_chat_id, message_id):
 
 def send_media(chat_id, item):
     """
-    Отправляет материал прежде всего по сохранённому file_id.
+    Отправляем материал по сохранённому Telegram file_id.
 
-    Поэтому исходный пост можно удалить из канала:
-    бот всё равно сможет отправить сохранённое фото/видео.
+    Благодаря этому после добавления в каталог
+    исходный пост в канале можно удалить.
 
-    Если отправка по file_id не удалась и пост ещё существует,
-    бот попробует скопировать исходный пост из канала.
+    Если file_id не сработает, пробуем скопировать
+    исходный пост из канала.
     """
 
     media_type = item.get("media_type")
@@ -96,7 +100,6 @@ def send_media(chat_id, item):
 
     # ФОТО
     if media_type == "photo":
-
         result = tg(
             "sendPhoto",
             {
@@ -107,7 +110,6 @@ def send_media(chat_id, item):
 
     # ВИДЕО
     elif media_type == "video":
-
         result = tg(
             "sendVideo",
             {
@@ -116,9 +118,8 @@ def send_media(chat_id, item):
             }
         )
 
-    # ВИДЕО, ОТПРАВЛЕННОЕ КАК ФАЙЛ
+    # ВИДЕО КАК ДОКУМЕНТ
     elif media_type == "video_document":
-
         result = tg(
             "sendDocument",
             {
@@ -129,7 +130,6 @@ def send_media(chat_id, item):
 
     # GIF
     elif media_type == "animation":
-
         result = tg(
             "sendAnimation",
             {
@@ -139,27 +139,21 @@ def send_media(chat_id, item):
         )
 
     else:
-
         send_message(
             chat_id,
             "⚠️ Неизвестный тип материала."
         )
-
         return None
 
-    # Резервный вариант:
-    # если file_id почему-то не сработал,
-    # пробуем исходный пост канала.
+    # Резервный вариант
     if (
         not result
         or result.get("ok") is not True
     ):
-
         if (
             item.get("source") == "channel"
             and item.get("message_id")
         ):
-
             return copy_message(
                 chat_id,
                 CHANNEL_ID,
@@ -174,18 +168,14 @@ def send_media(chat_id, item):
 # =========================================================
 
 def normalize_tags(text):
-
     text = text.strip().lower()
 
     if "," in text:
-
         tags = [
             x.strip().lstrip("#")
             for x in text.split(",")
         ]
-
     else:
-
         tags = [
             x.strip().lstrip("#")
             for x in text.split()
@@ -197,10 +187,8 @@ def normalize_tags(text):
         if tag
     ]
 
-    # Убираем дубликаты
-    return list(
-        dict.fromkeys(tags)
-    )
+    # Убираем повторяющиеся теги
+    return list(dict.fromkeys(tags))
 
 
 # =========================================================
@@ -208,7 +196,6 @@ def normalize_tags(text):
 # =========================================================
 
 def get_owner():
-
     owner = db.get(
         "owner_chat_id"
     )
@@ -225,18 +212,15 @@ def get_owner():
 
 def detect_media(message):
     """
-    Определяем фото/видео/GIF.
+    Определяем фото, видео или GIF.
     """
 
     # ФОТО
-    photos = message.get(
-        "photo"
-    )
+    photos = message.get("photo")
 
     if photos:
-
         # Последний элемент —
-        # наиболее крупная версия фото.
+        # самая большая версия фотографии
         photo = photos[-1]
 
         return (
@@ -245,54 +229,39 @@ def detect_media(message):
         )
 
     # ВИДЕО
-    video = message.get(
-        "video"
-    )
+    video = message.get("video")
 
     if video:
-
         return (
             "video",
             video.get("file_id")
         )
 
     # GIF
-    animation = message.get(
-        "animation"
-    )
+    animation = message.get("animation")
 
     if animation:
-
         return (
             "animation",
             animation.get("file_id")
         )
 
     # ДОКУМЕНТ
-    document = message.get(
-        "document"
-    )
+    document = message.get("document")
 
     if document:
-
         mime = document.get(
             "mime_type",
             ""
         )
 
-        if mime.startswith(
-            "video/"
-        ):
-
+        if mime.startswith("video/"):
             return (
                 "video_document",
                 document.get("file_id")
             )
 
-        if mime.startswith(
-            "image/"
-        ):
-
+        if mime.startswith("image/"):
             return (
                 "photo",
                 document.get("file_id")
@@ -306,18 +275,13 @@ def detect_media(message):
 # =========================================================
 
 def save_item(item, tags):
-
     item_id = item["item_id"]
 
     saved = {
         "item_id": item_id,
         "source": item["source"],
-        "message_id": item.get(
-            "message_id"
-        ),
-        "source_chat_id": item.get(
-            "source_chat_id"
-        ),
+        "message_id": item.get("message_id"),
+        "source_chat_id": item.get("source_chat_id"),
         "file_id": item["file_id"],
         "media_type": item["media_type"],
         "tags": tags
@@ -336,9 +300,8 @@ def save_item(item, tags):
         item_id
     )
 
-    # Индексируем теги
+    # Создаём индекс тегов
     for tag in tags:
-
         db.sadd(
             f"tag:{tag}",
             item_id
@@ -346,7 +309,6 @@ def save_item(item, tags):
 
 
 def get_item(item_id):
-
     raw = db.get(
         f"media:{item_id}"
     )
@@ -355,13 +317,9 @@ def get_item(item_id):
         return None
 
     try:
-
-        return json.loads(
-            raw
-        )
+        return json.loads(raw)
 
     except Exception:
-
         return None
 
 
@@ -370,23 +328,15 @@ def get_item(item_id):
 # =========================================================
 
 def queue_contains(item_id):
-
     for raw in db.lrange(
         "media_queue",
         0,
         -1
     ):
-
         try:
+            item = json.loads(raw)
 
-            item = json.loads(
-                raw
-            )
-
-            if (
-                item.get("item_id")
-                == item_id
-            ):
+            if item.get("item_id") == item_id:
                 return True
 
         except Exception:
@@ -396,10 +346,7 @@ def queue_contains(item_id):
 
 
 def add_to_queue(item):
-
-    item_id = item[
-        "item_id"
-    ]
+    item_id = item["item_id"]
 
     # Уже сохранён
     if db.exists(
@@ -408,16 +355,11 @@ def add_to_queue(item):
         return False
 
     # Уже ждёт тегов
-    if queue_contains(
-        item_id
-    ):
+    if queue_contains(item_id):
         return False
 
     was_empty = (
-        db.llen(
-            "media_queue"
-        )
-        == 0
+        db.llen("media_queue") == 0
     )
 
     db.rpush(
@@ -432,7 +374,6 @@ def add_to_queue(item):
 
 
 def current_pending():
-
     raw = db.lindex(
         "media_queue",
         0
@@ -442,18 +383,13 @@ def current_pending():
         return None
 
     try:
-
-        return json.loads(
-            raw
-        )
+        return json.loads(raw)
 
     except Exception:
-
         return None
 
 
 def ask_for_next_tags():
-
     owner = get_owner()
 
     if not owner:
@@ -462,12 +398,10 @@ def ask_for_next_tags():
     item = current_pending()
 
     if not item:
-
         send_message(
             owner,
             "✅ Очередь пуста."
         )
-
         return
 
     queue_size = db.llen(
@@ -484,20 +418,10 @@ def ask_for_next_tags():
         "📁 Материал"
     )
 
-    if (
-        item.get("source")
-        == "channel"
-    ):
-
-        source_name = (
-            "из канала"
-        )
-
+    if item.get("source") == "channel":
+        source_name = "из канала"
     else:
-
-        source_name = (
-            "импортировано через бота"
-        )
+        source_name = "импортировано через бота"
 
     send_message(
         owner,
@@ -510,7 +434,7 @@ def ask_for_next_tags():
         "/delete — не добавлять"
     )
 
-    # Показываем сам материал
+    # Показываем материал, которому сейчас задаём теги
     send_media(
         owner,
         item
@@ -522,6 +446,11 @@ def ask_for_next_tags():
 # =========================================================
 
 def search_items(tags):
+    """
+    Находим материалы, содержащие ВСЕ указанные теги.
+
+    После поиска весь список случайно перемешивается.
+    """
 
     if not tags:
         return []
@@ -531,8 +460,6 @@ def search_items(tags):
         for tag in tags
     ]
 
-    # Несколько тегов =
-    # материал должен содержать ВСЕ теги.
     ids = db.sinter(
         *keys
     )
@@ -540,15 +467,16 @@ def search_items(tags):
     items = []
 
     for item_id in ids:
-
         item = get_item(
             item_id
         )
 
         if item:
-            items.append(
-                item
-            )
+            items.append(item)
+
+    # Настоящее случайное перемешивание
+    # при каждом новом запросе
+    random.shuffle(items)
 
     return items
 
@@ -557,25 +485,14 @@ def search_items(tags):
 # WEB
 # =========================================================
 
-@app.route(
-    "/",
-    methods=["GET"]
-)
+@app.route("/", methods=["GET"])
 def home():
-
     try:
-
         db.ping()
-
-        database = (
-            "connected"
-        )
+        database = "connected"
 
     except Exception as e:
-
-        database = (
-            f"error: {e}"
-        )
+        database = f"error: {e}"
 
     return (
         "Vlad Media Library Bot is running. "
@@ -583,12 +500,8 @@ def home():
     )
 
 
-@app.route(
-    "/setup",
-    methods=["GET"]
-)
+@app.route("/setup", methods=["GET"])
 def setup():
-
     webhook_url = (
         request.url_root.rstrip("/")
         + "/webhook"
@@ -607,12 +520,8 @@ def setup():
     )
 
 
-@app.route(
-    "/checkbot",
-    methods=["GET"]
-)
+@app.route("/checkbot", methods=["GET"])
 def checkbot():
-
     response = requests.get(
         f"{TELEGRAM_API}/getMe",
         timeout=20
@@ -627,12 +536,8 @@ def checkbot():
 # WEBHOOK
 # =========================================================
 
-@app.route(
-    "/webhook",
-    methods=["POST"]
-)
+@app.route("/webhook", methods=["POST"])
 def webhook():
-
     update = (
         request.get_json(
             silent=True
@@ -658,33 +563,23 @@ def webhook():
     )
 
     if post:
-
         channel_id = (
             post.get(
                 "chat",
                 {}
-            ).get(
-                "id"
-            )
+            ).get("id")
         )
 
-        # Другие каналы игнорируем
-        if (
-            channel_id
-            != CHANNEL_ID
-        ):
-
+        # Игнорируем другие каналы
+        if channel_id != CHANNEL_ID:
             return "OK", 200
 
         media_type, file_id = (
-            detect_media(
-                post
-            )
+            detect_media(post)
         )
 
-        # Текстовый пост нам не нужен
+        # Обычный текстовый пост
         if not file_id:
-
             return "OK", 200
 
         message_id = post[
@@ -692,9 +587,7 @@ def webhook():
         ]
 
         item = {
-            "item_id": (
-                f"channel:{message_id}"
-            ),
+            "item_id": f"channel:{message_id}",
             "source": "channel",
             "source_chat_id": CHANNEL_ID,
             "message_id": message_id,
@@ -707,7 +600,6 @@ def webhook():
         )
 
         if was_empty:
-
             ask_for_next_tags()
 
         return "OK", 200
@@ -722,7 +614,6 @@ def webhook():
     )
 
     if not message:
-
         return "OK", 200
 
     chat = message.get(
@@ -731,21 +622,13 @@ def webhook():
     )
 
     # Работаем только в личке
-    if (
-        chat.get("type")
-        != "private"
-    ):
-
+    if chat.get("type") != "private":
         return "OK", 200
 
-    chat_id = chat[
-        "id"
-    ]
+    chat_id = chat["id"]
 
     text = (
-        message.get(
-            "text"
-        )
+        message.get("text")
         or ""
     ).strip()
 
@@ -755,42 +638,39 @@ def webhook():
     # =====================================================
 
     if text == "/start":
-
         owner = get_owner()
 
-        # Первый пользователь становится владельцем
         if owner is None:
-
             db.set(
                 "owner_chat_id",
                 chat_id
             )
 
         elif owner != chat_id:
-
             send_message(
                 chat_id,
                 "⛔ Это личная медиатека."
             )
-
             return "OK", 200
 
         send_message(
             chat_id,
             "🎬📷 Vlad Media Library\n\n"
             "НОВЫЕ МАТЕРИАЛЫ:\n"
-            "пересылай фото или видео "
-            "в канал.\n\n"
+            "пересылай фото или видео в канал.\n\n"
             "СТАРЫЕ МАТЕРИАЛЫ:\n"
-            "пересылай фото или видео "
-            "сюда, в личку боту.\n\n"
-            "Я попрошу теги и добавлю "
-            "материал в каталог.\n\n"
+            "пересылай фото или видео сюда, "
+            "в личку боту.\n\n"
+            "Я попрошу теги и добавлю материал "
+            "в каталог.\n\n"
+            "ПОИСК:\n"
+            f"за один запрос показываю до "
+            f"{SEARCH_LIMIT} случайных материалов.\n\n"
             "Команды:\n"
-            "/search тег — всё\n"
-            "/photo тег — фото\n"
-            "/video тег — видео\n"
-            "/tags — теги\n"
+            "/search тег — фото + видео\n"
+            "/photo тег — только фото\n"
+            "/video тег — только видео\n"
+            "/tags — все теги\n"
             "/count — статистика\n"
             "/queue — очередь\n"
             "/next — текущий материал\n"
@@ -798,13 +678,7 @@ def webhook():
             "/delete — убрать из очереди"
         )
 
-        if (
-            db.llen(
-                "media_queue"
-            )
-            > 0
-        ):
-
+        if db.llen("media_queue") > 0:
             ask_for_next_tags()
 
         return "OK", 200
@@ -817,35 +691,28 @@ def webhook():
     owner = get_owner()
 
     if owner != chat_id:
-
         send_message(
             chat_id,
             "⛔ Нет доступа."
         )
-
         return "OK", 200
 
 
     # =====================================================
-    # ИМПОРТ ФОТО/ВИДЕО ЧЕРЕЗ ЛИЧКУ БОТА
+    # ИМПОРТ СТАРОГО ФОТО/ВИДЕО ЧЕРЕЗ БОТА
     # =====================================================
 
     media_type, file_id = (
-        detect_media(
-            message
-        )
+        detect_media(message)
     )
 
     if file_id:
-
         import_id = db.incr(
             "next_import_id"
         )
 
         item = {
-            "item_id": (
-                f"import:{import_id}"
-            ),
+            "item_id": f"import:{import_id}",
             "source": "import",
             "source_chat_id": chat_id,
             "message_id": message.get(
@@ -860,11 +727,9 @@ def webhook():
         )
 
         if was_empty:
-
             ask_for_next_tags()
 
         else:
-
             queue_size = db.llen(
                 "media_queue"
             )
@@ -883,7 +748,6 @@ def webhook():
     # =====================================================
 
     if text == "/count":
-
         total = db.scard(
             "media_items"
         )
@@ -894,7 +758,6 @@ def webhook():
         for item_id in db.smembers(
             "media_items"
         ):
-
             item = get_item(
                 item_id
             )
@@ -906,11 +769,7 @@ def webhook():
                 "media_type"
             )
 
-            if (
-                media_type
-                == "photo"
-            ):
-
+            if media_type == "photo":
                 photos += 1
 
             elif media_type in (
@@ -918,7 +777,6 @@ def webhook():
                 "video_document",
                 "animation"
             ):
-
                 videos += 1
 
         queue = db.llen(
@@ -941,7 +799,6 @@ def webhook():
     # =====================================================
 
     if text == "/queue":
-
         queue = db.llen(
             "media_queue"
         )
@@ -959,21 +816,13 @@ def webhook():
     # =====================================================
 
     if text == "/next":
-
-        if (
-            db.llen(
-                "media_queue"
-            )
-            == 0
-        ):
-
+        if db.llen("media_queue") == 0:
             send_message(
                 chat_id,
                 "✅ Очередь пустая."
             )
 
         else:
-
             ask_for_next_tags()
 
         return "OK", 200
@@ -984,13 +833,11 @@ def webhook():
     # =====================================================
 
     if text == "/skip":
-
         raw = db.lpop(
             "media_queue"
         )
 
         if raw:
-
             db.rpush(
                 "media_queue",
                 raw
@@ -1005,7 +852,6 @@ def webhook():
             ask_for_next_tags()
 
         else:
-
             send_message(
                 chat_id,
                 "Очередь пустая."
@@ -1019,32 +865,21 @@ def webhook():
     # =====================================================
 
     if text == "/delete":
-
         raw = db.lpop(
             "media_queue"
         )
 
         if raw:
-
             send_message(
                 chat_id,
-                "🗑 Убрал материал "
-                "из очереди.\n\n"
-                "Само фото/видео "
-                "не удалено."
+                "🗑 Убрал материал из очереди.\n\n"
+                "Само фото/видео не удалено."
             )
 
-            if (
-                db.llen(
-                    "media_queue"
-                )
-                > 0
-            ):
-
+            if db.llen("media_queue") > 0:
                 ask_for_next_tags()
 
         else:
-
             send_message(
                 chat_id,
                 "Очередь пустая."
@@ -1058,13 +893,11 @@ def webhook():
     # =====================================================
 
     if text == "/tags":
-
         tags = []
 
         for key in db.scan_iter(
             "tag:*"
         ):
-
             tag = key[4:]
 
             count = db.scard(
@@ -1086,14 +919,12 @@ def webhook():
         )
 
         if not tags:
-
             send_message(
                 chat_id,
                 "Пока тегов нет."
             )
 
         else:
-
             lines = [
                 f"#{tag} — {count}"
                 for tag, count
@@ -1103,9 +934,7 @@ def webhook():
             send_message(
                 chat_id,
                 "🏷 Теги:\n\n"
-                + "\n".join(
-                    lines
-                )
+                + "\n".join(lines)
             )
 
         return "OK", 200
@@ -1118,30 +947,21 @@ def webhook():
     search_mode = None
     query = None
 
-    if text.startswith(
-        "/search"
-    ):
-
+    if text.startswith("/search"):
         search_mode = "all"
 
         query = text[
             len("/search"):
         ].strip()
 
-    elif text.startswith(
-        "/photo"
-    ):
-
+    elif text.startswith("/photo"):
         search_mode = "photo"
 
         query = text[
             len("/photo"):
         ].strip()
 
-    elif text.startswith(
-        "/video"
-    ):
-
+    elif text.startswith("/video"):
         search_mode = "video"
 
         query = text[
@@ -1150,9 +970,7 @@ def webhook():
 
 
     if search_mode:
-
         if not query:
-
             send_message(
                 chat_id,
                 "Укажи тег.\n\n"
@@ -1168,37 +986,26 @@ def webhook():
             query
         )
 
+        # Здесь список уже случайно перемешан
         items = search_items(
             tags
         )
 
-        # Только фотографии
-        if (
-            search_mode
-            == "photo"
-        ):
-
+        # Только фото
+        if search_mode == "photo":
             items = [
                 item
                 for item in items
-                if item.get(
-                    "media_type"
-                )
+                if item.get("media_type")
                 == "photo"
             ]
 
-        # Только видео/GIF
-        elif (
-            search_mode
-            == "video"
-        ):
-
+        # Только видео
+        elif search_mode == "video":
             items = [
                 item
                 for item in items
-                if item.get(
-                    "media_type"
-                )
+                if item.get("media_type")
                 in (
                     "video",
                     "video_document",
@@ -1207,7 +1014,6 @@ def webhook():
             ]
 
         if not items:
-
             send_message(
                 chat_id,
                 "🔎 Ничего не найдено."
@@ -1215,14 +1021,21 @@ def webhook():
 
             return "OK", 200
 
+        total_found = len(items)
+
+        # Берём максимум 50 из уже перемешанного списка
+        selected_items = items[
+            :SEARCH_LIMIT
+        ]
+
         send_message(
             chat_id,
-            f"🔎 Найдено: {len(items)}"
+            f"🎲 Найдено: {total_found}\n"
+            f"Показываю: {len(selected_items)} "
+            f"в случайном порядке."
         )
 
-        # Ограничиваем 20 результатами
-        for item in items[:20]:
-
+        for item in selected_items:
             send_media(
                 chat_id,
                 item
@@ -1241,12 +1054,13 @@ def webhook():
                 f"🏷 {formatted_tags}"
             )
 
-        if len(items) > 20:
-
+        if total_found > SEARCH_LIMIT:
             send_message(
                 chat_id,
-                f"Показаны первые 20 "
-                f"из {len(items)}."
+                f"🎲 Показаны случайные "
+                f"{SEARCH_LIMIT} из {total_found}.\n\n"
+                "Повтори тот же поиск, "
+                "чтобы получить новую случайную выборку."
             )
 
         return "OK", 200
@@ -1259,13 +1073,11 @@ def webhook():
     pending = current_pending()
 
     if pending and text:
-
         tags = normalize_tags(
             text
         )
 
         if not tags:
-
             send_message(
                 chat_id,
                 "Не смог распознать теги."
@@ -1278,7 +1090,6 @@ def webhook():
             tags
         )
 
-        # Убираем размеченный материал из очереди
         db.lpop(
             "media_queue"
         )
@@ -1286,22 +1097,13 @@ def webhook():
         formatted_tags = (
             ", ".join(
                 "#" + tag
-                for tag
-                in tags
+                for tag in tags
             )
         )
 
-        if (
-            pending.get(
-                "media_type"
-            )
-            == "photo"
-        ):
-
+        if pending.get("media_type") == "photo":
             media_name = "Фото"
-
         else:
-
             media_name = "Видео"
 
         send_message(
@@ -1310,18 +1112,10 @@ def webhook():
             f"🏷 {formatted_tags}"
         )
 
-        # Следующий материал
-        if (
-            db.llen(
-                "media_queue"
-            )
-            > 0
-        ):
-
+        if db.llen("media_queue") > 0:
             ask_for_next_tags()
 
         else:
-
             send_message(
                 chat_id,
                 "🎉 Очередь полностью разобрана."
@@ -1335,7 +1129,6 @@ def webhook():
     # =====================================================
 
     if text:
-
         send_message(
             chat_id,
             "Для поиска используй:\n"
@@ -1348,7 +1141,6 @@ def webhook():
 
 
 if __name__ == "__main__":
-
     port = int(
         os.environ.get(
             "PORT",
